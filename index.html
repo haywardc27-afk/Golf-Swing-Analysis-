@@ -37,55 +37,70 @@ function hideLoading(...ids){ ids.forEach(id => { document.getElementById(id+'Lo
 function showError(msg){ errorBox.textContent = msg; errorBox.style.display='block'; }
 function hideError(){ errorBox.style.display='none'; }
 
-// ── OPTIMIZED 3-FRAME EXTRACTION WITH LOWER RESOLUTION ──
+// ── FIXED HIGH-PERFORMANCE VIDEO EXTRACTION ENGINE ──
 async function extractSwingFrames(videoEl) {
-  return new Promise((resolve, reject) => {
+  return new Promise(async (resolve, reject) => {
+    // Force browser to wake up and map out the video matrix structure
+    if (videoEl.readyState < 2) {
+      await new Promise(r => videoEl.addEventListener('loadeddata', r, { once: true }));
+    }
+    
+    // Play & instantly pause to clear out any blank frame caching quirks (Crucial for Safari/Mobile Chrome)
+    try {
+      await videoEl.play();
+      videoEl.pause();
+    } catch(e) { /* Autoplay block bypass */ }
+
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
     const frames = [];
 
-    const onMeta = async () => {
-      try {
-        const dur = videoEl.duration;
-        if (!dur || !isFinite(dur)) { throw new Error('Cannot read video duration'); }
+    try {
+      const dur = videoEl.duration;
+      if (!dur || !isFinite(dur)) { throw new Error('Cannot read video duration parameters.'); }
 
-        // Divided strictly into Backswing, Swing (Impact), and Follow Through
-        const timestamps = [
-          dur * 0.35,      // Backswing (mid-to-top)
-          dur * 0.70,      // Swing / Impact Zone
-          dur * 0.95       // Follow-Through / Finish
-        ];
+      // 3 High-Speed Structural Checkpoints
+      const timestamps = [
+        dur * 0.35,      // Part 1: Backswing
+        dur * 0.70,      // Part 2: Swing/Impact
+        dur * 0.95       // Part 3: Follow-Through
+      ];
 
-        // Downscaled aggressively to 480x270 max to maximize performance
-        canvas.width  = Math.min(videoEl.videoWidth,  480);
-        canvas.height = Math.min(videoEl.videoHeight, 270);
-
-        for (const t of timestamps) {
-          await seekTo(videoEl, t);
-          ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
-          // Compressed image quality to 0.6 to minimize base64 payload size
-          const dataUrl = canvas.toDataURL('image/jpeg', 0.6); 
-          frames.push(dataUrl.split(',')[1]); 
-        }
-        resolve(frames);
-      } catch (err) {
-        reject(err);
+      // Maintain exact aspect ratio while scaling layout resolution down to optimize transmission
+      const maxDimension = 480; 
+      let scale = 1;
+      if (videoEl.videoWidth > maxDimension || videoEl.videoHeight > maxDimension) {
+        scale = maxDimension / Math.max(videoEl.videoWidth, videoEl.videoHeight);
       }
-    };
+      canvas.width  = Math.floor(videoEl.videoWidth * scale);
+      canvas.height = Math.floor(videoEl.videoHeight * scale);
 
-    if (videoEl.readyState >= 1) { onMeta(); }
-    else { videoEl.addEventListener('loadedmetadata', onMeta, { once: true }); }
+      for (const t of timestamps) {
+        await seekTo(videoEl, t);
+        // Clean frame clear
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+        
+        // Quality drop to 0.6 reduces Base64 data character overhead by roughly 60%
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.6); 
+        frames.push(dataUrl.split(',')[1]); 
+      }
+      resolve(frames);
+    } catch (err) {
+      reject(err);
+    }
   });
 }
 
 function seekTo(videoEl, time) {
   return new Promise(res => {
-    videoEl.currentTime = time;
     const onSeeked = () => {
       videoEl.removeEventListener('seeked', onSeeked);
-      res();
+      // Give the hardware dynamic renderer an extra 40ms to draw the actual pixel layout
+      setTimeout(res, 40); 
     };
     videoEl.addEventListener('seeked', onSeeked);
+    videoEl.currentTime = time;
   });
 }
 
@@ -100,8 +115,14 @@ function buildUnifiedPayload(frames, promptText) {
   return content;
 }
 
-function parseJSON(txt) {
-  return JSON.parse(txt.replace(/```json|```/g,'').trim());
+function parseSafeJSON(txt) {
+  try {
+    // Cleans out markdown code fences or hidden characters sometimes introduced by backend proxies
+    const cleaned = txt.replace(/```json|```/g,'').trim();
+    return JSON.parse(cleaned);
+  } catch (e) {
+    throw new Error("AI engine returned parsing formatting irregularities.");
+  }
 }
 
 async function analyze(){
@@ -115,7 +136,7 @@ async function analyze(){
   try {
     frames = await extractSwingFrames(videoEl);
   } catch(e) {
-    showError('Could not process this video format. Try an alternate MP4 format.');
+    showError('Could not process video timeline. Ensure it is a standard mobile-compatible file (MP4/MOV).');
     hideLoading('score','metrics','pro','drills','report');
     analyzeBtn.disabled = false;
     analyzeBtn.innerHTML = '<span>🔍</span> Analyze My Swing';
@@ -140,164 +161,4 @@ Respond ONLY with a single valid JSON object containing all required fields. No 
       {"name":"Impact Position","score":75,"tag":"warn","note":"observation"},
       {"name":"Finish & Balance","score":85,"tag":"good","note":"observation"}
     ],
-    "pros": [
-      {"name": "Justin Rose","matchLevel": "High Match","similarity": 83,"whyMatch": "traits","keyDiff": "diff","advice": "drill"}
-    ],
-    "drills": [
-      {"name": "Step Drill","fixes": "flaw","instructions": "directions"}
-    ],
-    "phases": [
-      {"phase": "Backswing", "tag": "good", "detail": "sentences explaining the backswing mechanics observed"},
-      {"phase": "Swing & Impact", "tag": "warn", "detail": "sentences explaining the downswing and impact mechanics observed"},
-      {"phase": "Follow-Through & Finish", "tag": "good", "detail": "sentences explaining the execution of the follow through"}
-    ]
-  }`;
-
-  const payload = buildUnifiedPayload(frames, unifiedPrompt);
-
-  try {
-    const res = await fetch(PROXY_API_ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1800,
-        system: systemPrompt,
-        messages: [{ role: "user", content: payload }]
-      })
-    });
-
-    if (!res.ok) throw new Error(`API returned status ${res.status}`);
-    
-    const data = await res.json();
-    const txt = data.content ? data.content.map(b => b.text || '').join('') : data;
-    const parsedData = parseJSON(txt);
-
-    hideLoading('score','metrics','pro','drills','report');
-    renderScore(parsedData.scoreData);
-    renderMetrics(parsedData.metrics);
-    renderPros(parsedData.pros);
-    renderDrills(parsedData.drills);
-    renderReport(parsedData.phases);
-
-  } catch (error) {
-    console.warn("Production API Endpoint offline. Loading high-performance demo engine visualization.", error);
-    
-    setTimeout(() => {
-      hideLoading('score','metrics','pro','drills','report');
-      renderScore({score:81, grade:'B+', summary:'Analysis run complete. Data successfully processed utilizing 3 key frame partitions.'});
-      renderMetrics(defaultMetrics());
-      renderPros(defaultPros());
-      renderDrills(defaultDrills());
-      renderReport(defaultReport());
-    }, 600);
-  } finally {
-    analyzeBtn.disabled = false;
-    analyzeBtn.innerHTML = '<span>🔄</span> Re-Analyze';
-  }
-}
-
-// ── RENDERERS ──
-function renderScore(d){
-  const pct = d.score || 75;
-  const color = pct >= 85 ? 'var(--green)' : pct >= 70 ? 'var(--amber)' : 'var(--red)';
-  const circumference = 2 * Math.PI * 46;
-  const offset = circumference * (1 - pct/100);
-  document.getElementById('scoreArea').innerHTML = `
-    <div class="score-ring">
-      <div class="ring-wrap">
-        <svg viewBox="0 0 110 110" width="110" height="110">
-          <circle cx="55" cy="55" r="46" fill="none" stroke="var(--border)" stroke-width="8"/>
-          <circle cx="55" cy="55" r="46" fill="none" stroke="${color}" stroke-width="8"
-            stroke-dasharray="${circumference}" stroke-dashoffset="${offset}"
-            stroke-linecap="round" style="transition:stroke-dashoffset 1.2s cubic-bezier(.4,0,.2,1)"/>
-        </svg>
-        <div class="ring-center">
-          <div class="ring-num" style="color:${color}">${pct}</div>
-          <div class="ring-label">/ 100</div>
-        </div>
-      </div>
-      <div class="score-desc">
-        <div class="score-grade" style="color:${color}">${d.grade || 'N/A'}</div>
-        <div class="score-summary">${d.summary || ''}</div>
-      </div>
-    </div>`;
-}
-
-function renderMetrics(metrics){
-  if (!metrics || !Array.isArray(metrics)) return;
-  const rows = metrics.map(m => {
-    const color = m.tag === 'good' ? 'var(--green)' : m.tag === 'warn' ? 'var(--amber)' : 'var(--red)';
-    return `<div class="metric">
-      <div class="metric-header">
-        <span class="metric-name">${m.name}</span>
-        <span class="metric-val" style="color:${color}">${m.score}%</span>
-      </div>
-      <div class="bar-track"><div class="bar-fill" style="width:${m.score}%;background:${color}"></div></div>
-      ${m.note ? `<div style="font-size:12px;color:var(--muted);margin-top:4px">${m.note}</div>` : ''}
-    </div>`;
-  }).join('');
-  document.getElementById('metricsArea').innerHTML = `<div class="metrics">${rows}</div>`;
-}
-
-function renderPros(pros){
-  if (!pros || !Array.isArray(pros)) return;
-  const levelClass = l => l.includes('High') ? '' : l.includes('Moderate') ? 'partial' : 'low';
-  const badgeClass = l => l.includes('High') ? 'badge-high' : l.includes('Moderate') ? 'badge-mid' : 'badge-low';
-  const html = pros.map(p => `
-    <div class="pro-card ${levelClass(p.matchLevel)}">
-      <div class="pro-name">${p.name} <span style="color:var(--muted);font-size:13px;font-weight:400">${p.similarity}% match</span></div>
-      <span class="pro-badge ${badgeClass(p.matchLevel)}">${p.matchLevel}</span>
-      <div class="pro-notes">
-        <b>Why this match:</b> ${p.whyMatch || p.sharedTraits || '—'}<br>
-        <b>Key difference:</b> ${p.keyDiff || '—'}<br>
-        <b>Coaching tip:</b> ${p.advice || '—'}
-      </div>
-    </div>`).join('');
-  document.getElementById('proArea').innerHTML = `<div class="pro-grid">${html}</div>`;
-}
-
-function renderDrills(drills){
-  if (!drills || !Array.isArray(drills)) return;
-  const items = drills.map(d => `<li><strong>${d.name}</strong> — <em style="color:var(--amber);font-size:12px">${d.fixes || d.focus || ''}</em><br>${d.instructions}</li>`).join('');
-  document.getElementById('drillsArea').innerHTML = `<ol>${items}</ol>`;
-}
-
-function renderReport(phases){
-  if (!phases || !Array.isArray(phases)) return;
-  const tagLabel = t => t === 'good' ? '<span class="tag tag-good">✓ Good</span>' : t === 'warn' ? '<span class="tag tag-warn">⚠ Improve</span>' : '<span class="tag tag-fix">✗ Fix</span>';
-  const html = phases.map(p => `
-    <div class="report-section">
-      <div class="report-phase">${tagLabel(p.tag)} ${p.phase}</div>
-      <div class="report-body">${p.detail}</div>
-    </div>`).join('');
-  document.getElementById('reportArea').innerHTML = html;
-}
-
-// ── FALLBACK DATA ──
-function defaultMetrics(){ return [
-  {name:'Setup & Posture',score:85,tag:'good',note:'Athletic setup spine alignment looks consistent.'},
-  {name:'Backswing Plane',score:72,tag:'warn',note:'Slight inside takeaway track identified.'},
-  {name:'Hip Rotation',score:68,tag:'warn',note:'Hip clear stalling out prior to hip-line release.'},
-  {name:'Transition Sequence',score:61,tag:'fix',note:'Upper body initiating downward release sequence early.'},
-  {name:'Impact Position',score:78,tag:'warn',note:'Forward shaft lean needs accentuation through low point.'},
-  {name:'Finish & Balance',score:88,tag:'good',note:'Solid finish extension over lead side leg.'}
-];}
-
-function defaultPros(){ return [
-  {name:'Justin Rose',matchLevel:'High Match',similarity:83,whyMatch:'Upright posture, consistent tempo, solid finish',keyDiff:'Impact shaft lean is more pronounced at tour level',advice:'Use an alignment stick under your lead arm at impact to train forward shaft lean.'},
-  {name:'Rory McIlroy',matchLevel:'Moderate Match',similarity:71,whyMatch:'Strong shoulder turn and athletic setup',keyDiff:'Hip speed through impact is significantly faster on tour',advice:'Practice the "step drill" to feel the hip-first downswing sequence.'}
-];}
-
-function defaultDrills(){ return [
-  {name:'Step Drill',fixes:'Hip sequence & rotation',instructions:'Take your normal backswing, then step your front foot down just before impact to trigger hip-first sequence.'},
-  {name:'Pump Drill',fixes:'Shallow transition plane',instructions:'Swing to the top, stop, "pump" the club halfway down three times to feel the shallowing move.'},
-  {name:'Impact Bag',fixes:'Forward shaft lean',instructions:'Strike an impact bag at a 45° angle, training your hands to lead the clubhead through impact.'}
-];}
-
-function defaultReport(){ return [
-  {phase:'Backswing',tag:'warn',detail:'Decent shoulder turn with good width, but the left arm shows a slight bend at the top. The club appears to move slightly inside on the takeaway which can push the plane off track.'},
-  {phase:'Swing & Impact',tag:'fix',detail:'The transition shows an arm-dominated move rather than lower body initiating the downswing. This creates a steep angle of attack. Impact position shows some positive forward shaft lean.'},
-  {phase:'Follow-Through & Finish',tag:'good',detail:'Solid balanced finish with clean weight distribution onto the lead foot. The follow-through extension is wide and stays fully controlled.'}
-];}
-</script>
+    "pros":
